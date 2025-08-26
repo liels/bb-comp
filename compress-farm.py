@@ -31,7 +31,9 @@ old_plots: List[Dict] = []
 min_size = 90 * (1 << 30)  # 90 GiB in bytes
 for machine in machines:
     plot_dirs = get_plot_dirs(machine)
+    logging.info(f"Plot directories on {machine}: {', '.join(plot_dirs)}")
     for plot_dir in plot_dirs:
+        logging.info(f"Scanning plots in {machine}:{plot_dir}")
         try:
             files_output = subprocess.check_output(
                 ['ssh', machine, f'ls {plot_dir}/plot-k32-*.plot 2>/dev/null']
@@ -181,7 +183,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         # Rename new plot to .tmp locally
         tmp_file = new_plot_file + '.tmp'
         full_tmp = os.path.join(final_dir, tmp_file)
-        print("The program is paused to rename file. Press Enter to continue.")
+        print("The program is paused for plot rename. Press Enter to continue.")
         input()  # Pauses here until Enter is pressed
         print("Execution resumed!")
         os.rename(full_new, full_tmp)
