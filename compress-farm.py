@@ -93,8 +93,28 @@ plot_command = [
     '--disk-128'
 ]
 
+generation_lock = threading.Lock()
 lock = threading.Lock()
 pending: Dict[Tuple[str, str], int] = {}
+
+# Pre-generate up to 16 compressed plots
+with generation_lock:
+    existing_plots = [
+        f for f in os.listdir(final_dir)
+        if f.startswith('plot-k32-') and f.endswith('.plot')
+        and os.path.getsize(os.path.join(final_dir, f)) < min_size
+    ]
+    num_compressed = len(existing_plots)
+    if num_compressed < 16:
+        count = 16 - num_compressed
+        temp_command = plot_command.copy()
+        count_idx = temp_command.index('--count')
+        temp_command[count_idx + 1] = str(count)
+        logging.info(f'Generating {count} additional compressed plots to reach 16.')
+        try:
+            subprocess.check_call(temp_command)
+        except Exception as e:
+            logging.error(f'Error pre-generating plots: {e}')
 
 def transfer_func(old: Dict, tmp_file: str, new_plot_file: str, deleted: bool, mkey: Tuple[str, str], full_tmp: str, new_size: int):
     try:
@@ -123,41 +143,51 @@ def transfer_func(old: Dict, tmp_file: str, new_plot_file: str, deleted: bool, m
         subprocess.call(['ssh', old['machine'], f'rm "{old["dir"]}/{tmp_file}" 2>/dev/null'])
         # Do not delete local file on failure
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-    futures = []
-    for old in old_plots:
+# Group old plots by machine
+old_by_machine: Dict[str, List[Dict]] = {}
+for old in old_plots:
+    mach = old['machine']
+    old_by_machine.setdefault(mach, []).append(old)
+
+def process_machine(mach: str, olds: List[Dict]):
+    for old in olds:
         logging.info(f'Starting replacement for {old["fullpath"]} on {old["machine"]}')
 
-        # Check for existing new plots
-        existing_plots = [
-            f for f in os.listdir(final_dir)
-            if f.startswith('plot-k32-') and f.endswith('.plot')
-            and os.path.getsize(os.path.join(final_dir, f)) < min_size
-        ]
-        if existing_plots:
-            new_plot_file = sorted(existing_plots)[0]
-            logging.info(f'Using existing plot {new_plot_file}')
-        else:
-            # List existing plots before generating new one
-            before_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
+        with generation_lock:
+            existing_plots = sorted([
+                f for f in os.listdir(final_dir)
+                if f.startswith('plot-k32-') and f.endswith('.plot')
+                and os.path.getsize(os.path.join(final_dir, f)) < min_size
+            ])
+            if existing_plots:
+                new_plot_file = existing_plots[0]
+                logging.info(f'Using existing plot {new_plot_file}')
+            else:
+                # List existing plots before generating new one
+                before_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
 
-            # Generate new plot
-            try:
-                subprocess.check_call(plot_command)
-            except Exception as e:
-                logging.error(f'Error generating plot: {e}')
-                continue
+                # Generate new plot
+                try:
+                    subprocess.check_call(plot_command)
+                except Exception as e:
+                    logging.error(f'Error generating plot: {e}')
+                    continue
 
-            # Find the new plot
-            after_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
-            new_files = list(after_plots - before_plots)
-            if len(new_files) != 1:
-                logging.error(f'Unexpected number of new plots: {new_files}')
-                continue
-            new_plot_file = new_files[0]
+                # Find the new plot
+                after_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
+                new_files = list(after_plots - before_plots)
+                if len(new_files) != 1:
+                    logging.error(f'Unexpected number of new plots: {new_files}')
+                    continue
+                new_plot_file = new_files[0]
 
-        full_new = os.path.join(final_dir, new_plot_file)
-        new_size = os.path.getsize(full_new)
+            full_new = os.path.join(final_dir, new_plot_file)
+            new_size = os.path.getsize(full_new)
+
+            # Rename new plot to .tmp locally
+            tmp_file = new_plot_file + '.tmp'
+            full_tmp = os.path.join(final_dir, tmp_file)
+            os.rename(full_new, full_tmp)
 
         # Get free space on target directory
         try:
@@ -167,7 +197,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             free_space = int(free_output)
         except Exception as e:
             logging.error(f'Error getting free space on {old["machine"]}:{old["dir"]}: {e}')
-            os.remove(full_new)  # Clean up unused new plot
+            os.remove(full_tmp)  # Clean up
             continue
 
         mkey = (old['machine'], old['dir'])
@@ -187,22 +217,19 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 deleted = True
             except Exception as e:
                 logging.error(f'Error deleting old plot {old["fullpath"]}: {e}')
-                os.remove(full_new)  # Clean up
+                os.remove(full_tmp)  # Clean up
                 continue
-
-        # Rename new plot to .tmp locally
-        tmp_file = new_plot_file + '.tmp'
-        full_tmp = os.path.join(final_dir, tmp_file)
-        print("The program is paused. Press Enter to continue.")
-        input()  # Pauses here until Enter is pressed
-        print("Execution resumed!")
-        os.rename(full_new, full_tmp)
 
         # Add to pending
         with lock:
             pending[mkey] = pending.get(mkey, 0) + new_size
 
-        # Submit to executor
-        futures.append(executor.submit(transfer_func, old, tmp_file, new_plot_file, deleted, mkey, full_tmp, new_size))
+        # Perform transfer
+        transfer_func(old, tmp_file, new_plot_file, deleted, mkey, full_tmp, new_size)
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    futures = []
+    for mach, olds in old_by_machine.items():
+        futures.append(executor.submit(process_machine, mach, olds))
 
     concurrent.futures.wait(futures)
