@@ -26,43 +26,53 @@ def get_plot_dirs(machine: str) -> List[str]:
         logging.error(f'Error getting config from {machine}: {e}')
         return []
 
+def scan_plot_dir(machine: str, plot_dir: str, min_size: int) -> List[Dict]:
+    logging.info(f"Scanning plots in {machine}:{plot_dir}")
+    try:
+        cmd = f"find {plot_dir} -maxdepth 1 -name 'plot-k32-*.plot' -exec stat -c '%s %n' {{}} + 2>/dev/null"
+        output = subprocess.check_output(['ssh', machine, cmd]).decode().splitlines()
+        plots = []
+        for line in output:
+            if line.strip():
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    size_str, full_path = parts
+                    try:
+                        file_size = int(size_str)
+                    except ValueError:
+                        continue
+                    if file_size < min_size:
+                        logging.info(f'Skipping small plot {full_path} ({file_size / (1 << 30):.2f} GiB)')
+                        continue
+                    basename = os.path.basename(full_path)
+                    plots.append({
+                        'machine': machine,
+                        'dir': plot_dir,
+                        'file': basename,
+                        'fullpath': full_path
+                    })
+        return plots
+    except Exception as e:
+        logging.error(f'Error scanning {machine}:{plot_dir}: {e}')
+        return []
+
 # Collect old plots
 old_plots: List[Dict] = []
 min_size = 90 * (1 << 30)  # 90 GiB in bytes
+
+# First, get all plot directories sequentially (quick operation)
+dir_pairs = []
 for machine in machines:
     plot_dirs = get_plot_dirs(machine)
     logging.info(f"Plot directories on {machine}: {', '.join(plot_dirs)}")
     for plot_dir in plot_dirs:
-        logging.info(f"Scanning plots in {machine}:{plot_dir}")
-        try:
-            files_output = subprocess.check_output(
-                ['ssh', machine, f'ls {plot_dir}/plot-k32-*.plot 2>/dev/null']
-            ).decode().splitlines()
-            for full_path in files_output:
-                # Get file size
-                try:
-                    size_output = subprocess.check_output(
-                        ['ssh', machine, f'stat -c %s "{full_path}"']
-                    ).decode().strip()
-                    file_size = int(size_output)
-                except Exception as e:
-                    logging.error(f'Error getting size of {full_path} on {machine}: {e}')
-                    continue
+        dir_pairs.append((machine, plot_dir))
 
-                if file_size < min_size:
-                    logging.info(f'Skipping small plot {full_path} ({file_size / (1 << 30):.2f} GiB)')
-                    continue
-
-                basename = os.path.basename(full_path)
-                old_plots.append({
-                    'machine': machine,
-                    'dir': plot_dir,
-                    'file': basename,
-                    'fullpath': full_path
-                })
-        except subprocess.CalledProcessError:
-            # No files matching, continue
-            pass
+# Scan directories in parallel
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    future_to_dir = {executor.submit(scan_plot_dir, m, d, min_size): (m, d) for m, d in dir_pairs}
+    for future in concurrent.futures.as_completed(future_to_dir):
+        old_plots.extend(future.result())
 
 logging.info(f'Found {len(old_plots)} old plots to replace.')
 
@@ -183,7 +193,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         # Rename new plot to .tmp locally
         tmp_file = new_plot_file + '.tmp'
         full_tmp = os.path.join(final_dir, tmp_file)
-        print("The program is paused for plot rename. Press Enter to continue.")
+        print("The program is paused. Press Enter to continue.")
         input()  # Pauses here until Enter is pressed
         print("Execution resumed!")
         os.rename(full_new, full_tmp)
