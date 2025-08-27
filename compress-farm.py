@@ -4,6 +4,7 @@ import yaml
 import logging
 import threading
 import concurrent.futures
+import time
 from typing import List, Dict, Tuple
 
 # Set up logging
@@ -83,6 +84,8 @@ logging.info(f'Found {len(old_plots)} old plots to process.')
 final_dir = '/var/TmpChia'
 buffer_space = 1 << 30  # 1 GiB buffer
 stop_threshold = 85 * (1 << 30)  # 85 GiB
+max_local_buffer = 32
+compressed_estimate = 85 * (1 << 30)  # ~85 GiB for C5 plot
 plot_command = [
     'chia', 'plotters', 'bladebit', 'cudaplot',
     '--threads', '32',
@@ -100,25 +103,49 @@ plot_command = [
 generation_lock = threading.Lock()
 lock = threading.Lock()
 pending: Dict[Tuple[str, str], int] = {}
+plot_stop = threading.Event()
 
-# Pre-generate up to 32 compressed plots
-with generation_lock:
-    existing_plots = [
-        f for f in os.listdir(final_dir)
-        if f.startswith('plot-k32-') and f.endswith('.plot')
-        and os.path.getsize(os.path.join(final_dir, f)) < min_size
-    ]
-    num_compressed = len(existing_plots)
-    if num_compressed < 32:
-        count = 32 - num_compressed
-        temp_command = plot_command.copy()
-        count_idx = temp_command.index('--count')
-        temp_command[count_idx + 1] = str(count)
-        logging.info(f'Generating {count} additional compressed plots to reach 32.')
-        try:
-            subprocess.check_call(temp_command)
-        except Exception as e:
-            logging.error(f'Error pre-generating plots: {e}')
+def plotter_thread():
+    while not plot_stop.is_set():
+        generated = False
+        with generation_lock:
+            existing_plots = [
+                f for f in os.listdir(final_dir)
+                if f.startswith('plot-k32-') and f.endswith('.plot')
+                and os.path.getsize(os.path.join(final_dir, f)) < min_size
+            ]
+            num = len(existing_plots)
+            if num >= max_local_buffer:
+                logging.info(f'Local buffer full with {num} plots, skipping generation.')
+            else:
+                # Check local free space
+                try:
+                    free_output = subprocess.check_output(
+                        ['df', '-B1', '--output=avail', final_dir]
+                    ).decode().splitlines()[-1].strip()
+                    local_free = int(free_output)
+                except Exception as e:
+                    logging.error(f'Error getting local free space: {e}')
+                    local_free = 0
+
+                if local_free > compressed_estimate + buffer_space:
+                    logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
+                    try:
+                        subprocess.check_call(plot_command)
+                        generated = True
+                    except Exception as e:
+                        logging.error(f'Error generating plot in background: {e}')
+                else:
+                    logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
+
+        if not generated:
+            time.sleep(60)  # Wait 1 min if not generated
+        else:
+            time.sleep(1)  # Short sleep if generated
+
+# Start background plotter
+plotter = threading.Thread(target=plotter_thread)
+plotter.start()
 
 def transfer_func(machine: str, plot_dir: str, tmp_file: str, new_plot_file: str, full_tmp: str, new_size: int, mkey: Tuple[str, str], old_fullpath: str = None):
     try:
@@ -179,32 +206,19 @@ def process_machine(mach: str):
 
             # Get a new compressed plot
             with generation_lock:
-                existing_plots = sorted([
-                    f for f in os.listdir(final_dir)
-                    if f.startswith('plot-k32-') and f.endswith('.plot')
-                    and os.path.getsize(os.path.join(final_dir, f)) < min_size
-                ])
-                if existing_plots:
-                    new_plot_file = existing_plots[0]
-                    logging.info(f'Using existing plot {new_plot_file}')
-                else:
-                    # List existing plots before generating new one
-                    before_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
-
-                    # Generate new plot
-                    try:
-                        subprocess.check_call(plot_command)
-                    except Exception as e:
-                        logging.error(f'Error generating plot: {e}')
-                        continue
-
-                    # Find the new plot
-                    after_plots = set(f for f in os.listdir(final_dir) if f.endswith('.plot'))
-                    new_files = list(after_plots - before_plots)
-                    if len(new_files) != 1:
-                        logging.error(f'Unexpected number of new plots: {new_files}')
-                        continue
-                    new_plot_file = new_files[0]
+                while True:
+                    existing_plots = sorted([
+                        f for f in os.listdir(final_dir)
+                        if f.startswith('plot-k32-') and f.endswith('.plot')
+                        and os.path.getsize(os.path.join(final_dir, f)) < min_size
+                    ])
+                    if existing_plots:
+                        new_plot_file = existing_plots[0]
+                        logging.info(f'Using existing plot {new_plot_file}')
+                        break
+                    else:
+                        logging.info('No plot available, waiting 30s')
+                        time.sleep(30)
 
                 full_new = os.path.join(final_dir, new_plot_file)
                 new_size = os.path.getsize(full_new)
@@ -218,9 +232,7 @@ def process_machine(mach: str):
             if effective_free < new_size + buffer_space:
                 if not remaining_olds:
                     logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
-                    # Put back the plot
-                    continue  # or break, but since we got it, but to put back, but since renamed not yet
-                    # No rename yet, so just continue
+                    continue
                 old = remaining_olds.pop(0)
                 logging.info(
                     f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
@@ -270,3 +282,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures.append(executor.submit(process_machine, mach))
 
     concurrent.futures.wait(futures)
+
+# Stop background plotter
+plot_stop.set()
+plotter.join()
