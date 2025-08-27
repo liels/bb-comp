@@ -108,6 +108,7 @@ def plotter_thread():
     while not plot_stop.is_set():
         generated = False
         local_free = 0
+        num = 0
         with generation_lock:
             existing_plots = [
                 f for f in os.listdir(final_dir)
@@ -208,8 +209,8 @@ def process_machine(mach: str):
                 pend = pending.get(mkey, 0)
                 effective_free = free_space - pend
 
-            if effective_free < stop_threshold:
-                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB, stopping for {mach}:{plot_dir}')
+            if effective_free < stop_threshold and len(remaining_olds) == 0:
+                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB and no more uncompressed plots, stopping for {mach}:{plot_dir}')
                 break
 
             # Get a new compressed plot
