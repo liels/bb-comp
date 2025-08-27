@@ -84,7 +84,6 @@ logging.info(f'Found {len(old_plots)} old plots to process.')
 final_dir = '/var/TmpChia'
 buffer_space = 1 << 30  # 1 GiB buffer
 stop_threshold = 85 * (1 << 30)  # 85 GiB
-max_local_buffer = 32
 compressed_estimate = 85 * (1 << 30)  # ~85 GiB for C5 plot
 plot_command = [
     'chia', 'plotters', 'bladebit', 'cudaplot',
@@ -115,31 +114,30 @@ def plotter_thread():
                 and os.path.getsize(os.path.join(final_dir, f)) < min_size
             ]
             num = len(existing_plots)
-            if num >= max_local_buffer:
-                logging.info(f'Local buffer full with {num} plots, skipping generation.')
-            else:
-                # Check local free space
-                try:
-                    free_output = subprocess.check_output(
-                        ['df', '-B1', '--output=avail', final_dir]
-                    ).decode().splitlines()[-1].strip()
-                    local_free = int(free_output)
-                except Exception as e:
-                    logging.error(f'Error getting local free space: {e}')
-                    local_free = 0
+            logging.info(f'Local buffer has {num} plots.')
+            # Check local free space
+            try:
+                free_output = subprocess.check_output(
+                    ['df', '-B1', '--output=avail', final_dir]
+                ).decode().splitlines()[-1].strip()
+                local_free = int(free_output)
+            except Exception as e:
+                logging.error(f'Error getting local free space: {e}')
+                local_free = 0
+            logging.info(f'Local free space: {local_free / (1 << 30):.2f} GiB')
 
-                if local_free > compressed_estimate + buffer_space:
-                    logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
-                    try:
-                        subprocess.check_call(plot_command)
-                        generated = True
-                    except Exception as e:
-                        logging.error(f'Error generating plot in background: {e}')
-                else:
-                    logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
+            if local_free > compressed_estimate + buffer_space:
+                logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
+                try:
+                    subprocess.check_call(plot_command)
+                    generated = True
+                except Exception as e:
+                    logging.error(f'Error generating plot in background: {e}')
+            else:
+                logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
 
         if not generated:
-            time.sleep(60)  # Wait 1 min if not generated
+            time.sleep(10)  # Wait 10s if not generated
         else:
             time.sleep(1)  # Short sleep if generated
 
@@ -148,30 +146,39 @@ plotter = threading.Thread(target=plotter_thread)
 plotter.start()
 
 def transfer_func(machine: str, plot_dir: str, tmp_file: str, new_plot_file: str, full_tmp: str, new_size: int, mkey: Tuple[str, str], old_fullpath: str = None):
-    try:
-        logging.info(f'Copying {tmp_file} to {machine}:{plot_dir}')
-        subprocess.check_call(['scp', full_tmp, f'{machine}:{plot_dir}/'])
+    retries = 3
+    for attempt in range(retries):
+        try:
+            logging.info(f'Copying {tmp_file} to {machine}:{plot_dir} (attempt {attempt+1}/{retries})')
+            subprocess.check_call(['scp', full_tmp, f'{machine}:{plot_dir}/'])
 
-        logging.info(f'Renaming {tmp_file} to {new_plot_file} on {machine}')
-        subprocess.check_call(
-            ['ssh', machine, f'mv "{plot_dir}/{tmp_file}" "{plot_dir}/{new_plot_file}"']
-        )
+            logging.info(f'Renaming {tmp_file} to {new_plot_file} on {machine}')
+            subprocess.check_call(
+                ['ssh', machine, f'mv "{plot_dir}/{tmp_file}" "{plot_dir}/{new_plot_file}"']
+            )
 
-        with lock:
-            pending[mkey] -= new_size
+            with lock:
+                pending[mkey] -= new_size
 
-        if old_fullpath:
-            logging.info(f'Deleted {old_fullpath} to make space and added {new_plot_file}')
-        else:
-            logging.info(f'Added {new_plot_file}')
+            if old_fullpath:
+                logging.info(f'Deleted {old_fullpath} to make space and added {new_plot_file}')
+            else:
+                logging.info(f'Added {new_plot_file}')
 
-        # Delete the renamed plot on coroline after transfer complete
-        os.remove(full_tmp)
+            # Delete the renamed plot on coroline after transfer complete
+            os.remove(full_tmp)
+            return
 
-    except Exception as e:
-        logging.error(f'Error during transfer to {machine}:{plot_dir}: {e}')
-        subprocess.call(['ssh', machine, f'rm "{plot_dir}/{tmp_file}" 2>/dev/null'])
-        # Do not delete local file on failure
+        except Exception as e:
+            logging.error(f'Error during transfer to {machine}:{plot_dir} (attempt {attempt+1}/{retries}): {e}')
+            subprocess.call(['ssh', machine, f'rm "{plot_dir}/{tmp_file}" 2>/dev/null'])
+            if attempt < retries - 1:
+                time.sleep(10)  # Wait before retry
+
+    # Final failure - rename back to .plot and put back in pool
+    original_file = os.path.join(final_dir, new_plot_file)
+    os.rename(full_tmp, original_file)
+    logging.error(f'Failed to transfer {tmp_file} after {retries} attempts. Renamed back to {new_plot_file} and returned to pool.')
 
 # Group old plots by filesystem
 old_by_fs: Dict[Tuple[str, str], List[Dict]] = {}
@@ -217,8 +224,8 @@ def process_machine(mach: str):
                         logging.info(f'Using existing plot {new_plot_file}')
                         break
                     else:
-                        logging.info('No plot available, waiting 30s')
-                        time.sleep(30)
+                        logging.info('No plot available, waiting 10s')
+                        time.sleep(10)
 
                 full_new = os.path.join(final_dir, new_plot_file)
                 new_size = os.path.getsize(full_new)
