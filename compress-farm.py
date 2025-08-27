@@ -44,6 +44,7 @@ def scan_plot_dir(machine: str, plot_dir: str, min_size: int) -> List[Dict]:
                     # Skip compressed plots
                     if file_size < min_size:
 #                        logging.info(f'Skipping small plot {full_path} ({file_size / (1 << 30):.2f} GiB)')
+# Throwing a comment in because I'm not sure what VS Code is doing with git
                         continue
                     basename = os.path.basename(full_path)
                     plots.append({
