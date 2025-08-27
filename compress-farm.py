@@ -186,106 +186,114 @@ for old in old_plots:
     key = (old['machine'], old['dir'])
     old_by_fs.setdefault(key, []).append(old)
 
-def process_directory(mach: str, plot_dir: str):
-    mkey = (mach, plot_dir)
-    remaining_olds = old_by_fs.get(mkey, []).copy()
-    logging.info(f'Processing filesystem {mach}:{plot_dir} with {len(remaining_olds)} uncompressed plots')
+def process_machine(mach: str):
+    for plot_dir in dirs_by_machine[mach]:
+        mkey = (mach, plot_dir)
+        remaining_olds = old_by_fs.get(mkey, []).copy()
+        logging.info(f'Processing filesystem {mach}:{plot_dir} with {len(remaining_olds)} uncompressed plots')
 
-    while True:
-        # Get free space
-        try:
-            free_output = subprocess.check_output(
-                ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
-            ).decode().strip()
-            free_space = int(free_output)
-        except Exception as e:
-            logging.error(f'Error getting free space on {mach}:{plot_dir}: {e}')
-            break
-
-        with lock:
-            pend = pending.get(mkey, 0)
-            effective_free = free_space - pend
-
-        if effective_free < stop_threshold and len(remaining_olds) == 0:
-            logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB and no more uncompressed plots, stopping for {mach}:{plot_dir}')
-            break
-
-        # Get a new compressed plot
-        with generation_lock:
-            while True:
-                existing_plots = sorted([
-                    f for f in os.listdir(final_dir)
-                    if f.startswith('plot-k32-') and f.endswith('.plot')
-                    and os.path.getsize(os.path.join(final_dir, f)) < min_size
-                ])
-                if existing_plots:
-                    new_plot_file = existing_plots[0]
-                    logging.info(f'Using existing plot {new_plot_file}')
-                    break
-                else:
-                    logging.info('No plot available, waiting 10s')
-                    time.sleep(10)
-
-            full_new = os.path.join(final_dir, new_plot_file)
-            new_size = os.path.getsize(full_new)
-
-        # Recheck effective free (in case pend changed)
-        with lock:
-            pend = pending.get(mkey, 0)
-            effective_free = free_space - pend
-
-        old_fullpath = None
-        if effective_free < new_size + buffer_space:
-            if not remaining_olds:
-                logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
-                continue
-            old = remaining_olds.pop(0)
-            logging.info(
-                f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
-                f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
-                f'deleting uncompressed plot {old["fullpath"]}'
-            )
-            try:
-                subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
-                old_fullpath = old['fullpath']
-            except Exception as e:
-                logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
-                continue
-
-            # Re-get free space after delete
+        while True:
+            # Get free space
             try:
                 free_output = subprocess.check_output(
                     ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
                 ).decode().strip()
                 free_space = int(free_output)
             except Exception as e:
-                logging.error(f'Error getting free space after delete: {e}')
-                continue
+                logging.error(f'Error getting free space on {mach}:{plot_dir}: {e}')
+                break
 
             with lock:
                 pend = pending.get(mkey, 0)
                 effective_free = free_space - pend
 
+            if effective_free < stop_threshold and len(remaining_olds) == 0:
+                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB and no more uncompressed plots, stopping for {mach}:{plot_dir}')
+                break
+
+            # Get a new compressed plot
+            with generation_lock:
+                existing_plots = sorted([
+                    f for f in os.listdir(final_dir)
+                    if f.startswith('plot-k32-') and f.endswith('.plot')
+                    and os.path.getsize(os.path.join(final_dir, f)) < min_size
+                ])
+                if not existing_plots:
+                    logging.info('No plot available, waiting 10s')
+                    time.sleep(10)
+                    continue
+
+                new_plot_file = existing_plots[0]
+                logging.info(f'Using existing plot {new_plot_file}')
+
+                full_new = os.path.join(final_dir, new_plot_file)
+                new_size = os.path.getsize(full_new)
+
+                # Rename new plot to .tmp locally inside lock
+                tmp_file = new_plot_file + '.tmp'
+                full_tmp = os.path.join(final_dir, tmp_file)
+                os.rename(full_new, full_tmp)
+
+            # Recheck effective free (in case pend changed)
+            with lock:
+                pend = pending.get(mkey, 0)
+                effective_free = free_space - pend
+
+            old_fullpath = None
             if effective_free < new_size + buffer_space:
-                logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
-                continue
+                if not remaining_olds:
+                    logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
+                    # Rename back since not using
+                    os.rename(full_tmp, full_new)
+                    continue
+                old = remaining_olds.pop(0)
+                logging.info(
+                    f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
+                    f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
+                    f'deleting uncompressed plot {old["fullpath"]}'
+                )
+                try:
+                    subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
+                    old_fullpath = old['fullpath']
+                except Exception as e:
+                    logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
+                    # Rename back
+                    os.rename(full_tmp, full_new)
+                    continue
 
-        # Rename new plot to .tmp locally
-        tmp_file = new_plot_file + '.tmp'
-        full_tmp = os.path.join(final_dir, tmp_file)
-        os.rename(full_new, full_tmp)
+                # Re-get free space after delete
+                try:
+                    free_output = subprocess.check_output(
+                        ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
+                    ).decode().strip()
+                    free_space = int(free_output)
+                except Exception as e:
+                    logging.error(f'Error getting free space after delete: {e}')
+                    # Rename back
+                    os.rename(full_tmp, full_new)
+                    continue
 
-        # Add to pending
-        with lock:
-            pending[mkey] = pending.get(mkey, 0) + new_size
+                with lock:
+                    pend = pending.get(mkey, 0)
+                    effective_free = free_space - pend
 
-        # Perform transfer
-        transfer_func(mach, plot_dir, tmp_file, new_plot_file, full_tmp, new_size, mkey, old_fullpath)
+                if effective_free < new_size + buffer_space:
+                    logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
+                    # Rename back
+                    os.rename(full_tmp, full_new)
+                    continue
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=len(dir_pairs)) as executor:
+            # Add to pending
+            with lock:
+                pending[mkey] = pending.get(mkey, 0) + new_size
+
+            # Perform transfer
+            transfer_func(mach, plot_dir, tmp_file, new_plot_file, full_tmp, new_size, mkey, old_fullpath)
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     futures = []
-    for m, d in dir_pairs:
-        futures.append(executor.submit(process_directory, m, d))
+    for mach in machines:
+        futures.append(executor.submit(process_machine, mach))
 
     concurrent.futures.wait(futures)
 
