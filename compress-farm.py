@@ -107,6 +107,7 @@ plot_stop = threading.Event()
 def plotter_thread():
     while not plot_stop.is_set():
         generated = False
+        local_free = 0
         with generation_lock:
             existing_plots = [
                 f for f in os.listdir(final_dir)
@@ -128,13 +129,13 @@ def plotter_thread():
 
             if local_free > compressed_estimate + buffer_space:
                 logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
-                try:
-                    subprocess.check_call(plot_command)
-                    generated = True
-                except Exception as e:
-                    logging.error(f'Error generating plot in background: {e}')
-            else:
-                logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
+                generated = True
+        if generated:
+            try:
+                subprocess.check_call(plot_command)
+            except Exception as e:
+                logging.error(f'Error generating plot in background: {e}')
+                generated = False
 
         if not generated:
             time.sleep(10)  # Wait 10s if not generated
@@ -207,8 +208,8 @@ def process_machine(mach: str):
                 pend = pending.get(mkey, 0)
                 effective_free = free_space - pend
 
-            if effective_free < stop_threshold and len(remaining_olds) == 0:
-                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB and no more uncompressed plots, stopping for {mach}:{plot_dir}')
+            if effective_free < stop_threshold:
+                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB, stopping for {mach}:{plot_dir}')
                 break
 
             # Get a new compressed plot
@@ -239,43 +240,37 @@ def process_machine(mach: str):
             if effective_free < new_size + buffer_space:
                 if not remaining_olds:
                     logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
-                    # Since no deletion possible, and space insufficient for add, break if also below stop_threshold
-                    if effective_free < stop_threshold:
-                        break
-                    else:
-                        # If space sufficient for add without delete, continue to add
-                        pass
-                else:
-                    old = remaining_olds.pop(0)
-                    logging.info(
-                        f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
-                        f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
-                        f'deleting uncompressed plot {old["fullpath"]}'
-                    )
-                    try:
-                        subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
-                        old_fullpath = old['fullpath']
-                    except Exception as e:
-                        logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
-                        continue
+                    continue
+                old = remaining_olds.pop(0)
+                logging.info(
+                    f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
+                    f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
+                    f'deleting uncompressed plot {old["fullpath"]}'
+                )
+                try:
+                    subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
+                    old_fullpath = old['fullpath']
+                except Exception as e:
+                    logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
+                    continue
 
-                    # Re-get free space after delete
-                    try:
-                        free_output = subprocess.check_output(
-                            ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
-                        ).decode().strip()
-                        free_space = int(free_output)
-                    except Exception as e:
-                        logging.error(f'Error getting free space after delete: {e}')
-                        continue
+                # Re-get free space after delete
+                try:
+                    free_output = subprocess.check_output(
+                        ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
+                    ).decode().strip()
+                    free_space = int(free_output)
+                except Exception as e:
+                    logging.error(f'Error getting free space after delete: {e}')
+                    continue
 
-                    with lock:
-                        pend = pending.get(mkey, 0)
-                        effective_free = free_space - pend
+                with lock:
+                    pend = pending.get(mkey, 0)
+                    effective_free = free_space - pend
 
-                    if effective_free < new_size + buffer_space:
-                        logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
-                        continue
+                if effective_free < new_size + buffer_space:
+                    logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
+                    continue
 
             # Rename new plot to .tmp locally
             tmp_file = new_plot_file + '.tmp'
