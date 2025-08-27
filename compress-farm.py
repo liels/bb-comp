@@ -293,3 +293,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
 # Stop background plotter
 plot_stop.set()
 plotter.join()
+
+# Output reminder message
+reminder_msg = "Script has completed converting all available space to compressed plots. Remember to edit /etc/fstab and remount the drives as read-only."
+logging.info(reminder_msg)
+print(reminder_msg)
