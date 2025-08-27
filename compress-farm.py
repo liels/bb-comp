@@ -126,15 +126,22 @@ def plotter_thread():
                 local_free = 0
             logging.info(f'Local free space: {local_free / (1 << 30):.2f} GiB')
 
-            if local_free > compressed_estimate + buffer_space:
-                logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
-                try:
-                    subprocess.check_call(plot_command)
-                    generated = True
-                except Exception as e:
-                    logging.error(f'Error generating plot in background: {e}')
+            if num < 24 and local_free > compressed_estimate + buffer_space:
+                count = 24 - num
+                possible_count = (local_free - buffer_space) // compressed_estimate
+                count = min(count, possible_count)
+                if count > 0:
+                    logging.info(f'Generating {count} new plots to reach at least 24 in buffer, current {num}, free {local_free / (1 << 30):.2f} GiB')
+                    temp_command = plot_command.copy()
+                    count_idx = temp_command.index('--count') + 1
+                    temp_command[count_idx] = str(count)
+                    try:
+                        subprocess.check_call(temp_command)
+                        generated = True
+                    except Exception as e:
+                        logging.error(f'Error generating plots in background: {e}')
             else:
-                logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
+                logging.info(f'Buffer at or above 24 or insufficient space: {num} plots, free {local_free / (1 << 30):.2f} GiB')
 
         if not generated:
             time.sleep(10)  # Wait 10s if not generated
@@ -213,26 +220,22 @@ def process_machine(mach: str):
 
             # Get a new compressed plot
             with generation_lock:
-                existing_plots = sorted([
-                    f for f in os.listdir(final_dir)
-                    if f.startswith('plot-k32-') and f.endswith('.plot')
-                    and os.path.getsize(os.path.join(final_dir, f)) < min_size
-                ])
-                if not existing_plots:
-                    logging.info('No plot available, waiting 10s')
-                    time.sleep(10)
-                    continue
-
-                new_plot_file = existing_plots[0]
-                logging.info(f'Using existing plot {new_plot_file}')
+                while True:
+                    existing_plots = sorted([
+                        f for f in os.listdir(final_dir)
+                        if f.startswith('plot-k32-') and f.endswith('.plot')
+                        and os.path.getsize(os.path.join(final_dir, f)) < min_size
+                    ])
+                    if existing_plots:
+                        new_plot_file = existing_plots[0]
+                        logging.info(f'Using existing plot {new_plot_file}')
+                        break
+                    else:
+                        logging.info('No plot available, waiting 10s')
+                        time.sleep(10)
 
                 full_new = os.path.join(final_dir, new_plot_file)
                 new_size = os.path.getsize(full_new)
-
-                # Rename new plot to .tmp locally inside lock
-                tmp_file = new_plot_file + '.tmp'
-                full_tmp = os.path.join(final_dir, tmp_file)
-                os.rename(full_new, full_tmp)
 
             # Recheck effective free (in case pend changed)
             with lock:
@@ -243,8 +246,6 @@ def process_machine(mach: str):
             if effective_free < new_size + buffer_space:
                 if not remaining_olds:
                     logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
-                    # Rename back since not using
-                    os.rename(full_tmp, full_new)
                     continue
                 old = remaining_olds.pop(0)
                 logging.info(
@@ -257,8 +258,6 @@ def process_machine(mach: str):
                     old_fullpath = old['fullpath']
                 except Exception as e:
                     logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
-                    # Rename back
-                    os.rename(full_tmp, full_new)
                     continue
 
                 # Re-get free space after delete
@@ -269,8 +268,6 @@ def process_machine(mach: str):
                     free_space = int(free_output)
                 except Exception as e:
                     logging.error(f'Error getting free space after delete: {e}')
-                    # Rename back
-                    os.rename(full_tmp, full_new)
                     continue
 
                 with lock:
@@ -279,9 +276,12 @@ def process_machine(mach: str):
 
                 if effective_free < new_size + buffer_space:
                     logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
-                    # Rename back
-                    os.rename(full_tmp, full_new)
                     continue
+
+            # Rename new plot to .tmp locally
+            tmp_file = new_plot_file + '.tmp'
+            full_tmp = os.path.join(final_dir, tmp_file)
+            os.rename(full_new, full_tmp)
 
             # Add to pending
             with lock:
