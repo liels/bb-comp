@@ -129,10 +129,6 @@ def transfer_func(old: Dict, tmp_file: str, new_plot_file: str, deleted: bool, m
         with lock:
             pending[mkey] -= new_size
 
-        if not deleted:
-            logging.info(f'Deleting old plot {old["fullpath"]}')
-            subprocess.check_call(['ssh', old['machine'], f'rm "{old["fullpath"]}"'])
-
         logging.info(f'Replacement complete for {old["fullpath"]} with {new_plot_file}')
 
         # Delete the renamed plot on coroline after transfer complete
