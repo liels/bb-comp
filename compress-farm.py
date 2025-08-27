@@ -17,71 +17,6 @@ logging.basicConfig(
 # List of machines
 machines = ['omni', 'neo', 'archon']
 
-# Plotting parameters
-final_dir = '/var/TmpChia'
-buffer_space = 1 << 30  # 1 GiB buffer
-stop_threshold = 85 * (1 << 30)  # 85 GiB
-compressed_estimate = 85 * (1 << 30)  # ~85 GiB for C5 plot
-plot_command = [
-    'chia', 'plotters', 'bladebit', 'cudaplot',
-    '--threads', '32',
-    '--count', '1',
-    '--farmerkey', 'a495c8129d58d6a74e79bf0ed46c88717fa5eb75466be8ebd0745650ca46903cc01cc63699a0ef6b7ac955791058b83e',
-    '--contract', 'xch1pkzac5sx0wk9xe7hm8a2g42fr7ep8x7tm7nmf0k06jsjlz98c4rqt6c8df',
-    '--tmp_dir', '/var/TmpChia',
-    '--tmp_dir2', '/var/TmpChia',
-    '--verbose',
-    '--final_dir', final_dir,
-    '--compress', '5',
-    '--disk-128'
-]
-
-generation_lock = threading.Lock()
-lock = threading.Lock()
-pending: Dict[Tuple[str, str], int] = {}
-plot_stop = threading.Event()
-
-def plotter_thread():
-    while not plot_stop.is_set():
-        generated = False
-        with generation_lock:
-            existing_plots = [
-                f for f in os.listdir(final_dir)
-                if f.startswith('plot-k32-') and f.endswith('.plot')
-                and os.path.getsize(os.path.join(final_dir, f)) < min_size
-            ]
-            num = len(existing_plots)
-            logging.info(f'Local buffer has {num} plots.')
-            # Check local free space
-            try:
-                free_output = subprocess.check_output(
-                    ['df', '-B1', '--output=avail', final_dir]
-                ).decode().splitlines()[-1].strip()
-                local_free = int(free_output)
-            except Exception as e:
-                logging.error(f'Error getting local free space: {e}')
-                local_free = 0
-            logging.info(f'Local free space: {local_free / (1 << 30):.2f} GiB')
-
-            if local_free > compressed_estimate + buffer_space:
-                logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
-                try:
-                    subprocess.check_call(plot_command)
-                    generated = True
-                except Exception as e:
-                    logging.error(f'Error generating plot in background: {e}')
-            else:
-                logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
-
-        if not generated:
-            time.sleep(10)  # Wait 10s if not generated
-        else:
-            time.sleep(1)  # Short sleep if generated
-
-# Start background plotter early
-plotter = threading.Thread(target=plotter_thread)
-plotter.start()
-
 def get_plot_dirs(machine: str) -> List[str]:
     config_path = '/home/phil/.chia/mainnet/config/config.yaml'
     try:
@@ -145,6 +80,71 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
 
 logging.info(f'Found {len(old_plots)} old plots to process.')
 
+# Plotting parameters
+final_dir = '/var/TmpChia'
+buffer_space = 1 << 30  # 1 GiB buffer
+stop_threshold = 85 * (1 << 30)  # 85 GiB
+compressed_estimate = 85 * (1 << 30)  # ~85 GiB for C5 plot
+plot_command = [
+    'chia', 'plotters', 'bladebit', 'cudaplot',
+    '--threads', '32',
+    '--count', '1',
+    '--farmerkey', 'a495c8129d58d6a74e79bf0ed46c88717fa5eb75466be8ebd0745650ca46903cc01cc63699a0ef6b7ac955791058b83e',
+    '--contract', 'xch1pkzac5sx0wk9xe7hm8a2g42fr7ep8x7tm7nmf0k06jsjlz98c4rqt6c8df',
+    '--tmp_dir', '/var/TmpChia',
+    '--tmp_dir2', '/var/TmpChia',
+    '--verbose',
+    '--final_dir', final_dir,
+    '--compress', '5',
+    '--disk-128'
+]
+
+generation_lock = threading.Lock()
+lock = threading.Lock()
+pending: Dict[Tuple[str, str], int] = {}
+plot_stop = threading.Event()
+
+def plotter_thread():
+    while not plot_stop.is_set():
+        generated = False
+        with generation_lock:
+            existing_plots = [
+                f for f in os.listdir(final_dir)
+                if f.startswith('plot-k32-') and f.endswith('.plot')
+                and os.path.getsize(os.path.join(final_dir, f)) < min_size
+            ]
+            num = len(existing_plots)
+            logging.info(f'Local buffer has {num} plots.')
+            # Check local free space
+            try:
+                free_output = subprocess.check_output(
+                    ['df', '-B1', '--output=avail', final_dir]
+                ).decode().splitlines()[-1].strip()
+                local_free = int(free_output)
+            except Exception as e:
+                logging.error(f'Error getting local free space: {e}')
+                local_free = 0
+            logging.info(f'Local free space: {local_free / (1 << 30):.2f} GiB')
+
+            if local_free > compressed_estimate + buffer_space:
+                logging.info(f'Generating new plot, current local buffer {num}, free {local_free / (1 << 30):.2f} GiB')
+                try:
+                    subprocess.check_call(plot_command)
+                    generated = True
+                except Exception as e:
+                    logging.error(f'Error generating plot in background: {e}')
+            else:
+                logging.info(f'Insufficient local space for new plot: {local_free / (1 << 30):.2f} GiB')
+
+        if not generated:
+            time.sleep(10)  # Wait 10s if not generated
+        else:
+            time.sleep(1)  # Short sleep if generated
+
+# Start background plotter
+plotter = threading.Thread(target=plotter_thread)
+plotter.start()
+
 def transfer_func(machine: str, plot_dir: str, tmp_file: str, new_plot_file: str, full_tmp: str, new_size: int, mkey: Tuple[str, str], old_fullpath: str = None):
     retries = 3
     for attempt in range(retries):
@@ -207,8 +207,8 @@ def process_machine(mach: str):
                 pend = pending.get(mkey, 0)
                 effective_free = free_space - pend
 
-            if effective_free < stop_threshold:
-                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB, stopping for {mach}:{plot_dir}')
+            if effective_free < stop_threshold and len(remaining_olds) == 0:
+                logging.info(f'Effective free space {effective_free / (1 << 30):.2f} GiB < 85 GiB and no more uncompressed plots, stopping for {mach}:{plot_dir}')
                 break
 
             # Get a new compressed plot
@@ -239,37 +239,43 @@ def process_machine(mach: str):
             if effective_free < new_size + buffer_space:
                 if not remaining_olds:
                     logging.info(f'Insufficient space and no more uncompressed plots to delete for {mach}:{plot_dir}')
-                    continue
-                old = remaining_olds.pop(0)
-                logging.info(
-                    f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
-                    f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
-                    f'deleting uncompressed plot {old["fullpath"]}'
-                )
-                try:
-                    subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
-                    old_fullpath = old['fullpath']
-                except Exception as e:
-                    logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
-                    continue
+                    # Since no deletion possible, and space insufficient for add, break if also below stop_threshold
+                    if effective_free < stop_threshold:
+                        break
+                    else:
+                        # If space sufficient for add without delete, continue to add
+                        pass
+                else:
+                    old = remaining_olds.pop(0)
+                    logging.info(
+                        f'Insufficient space ({effective_free / (1 << 30):.2f} GiB free, '
+                        f'need {(new_size + buffer_space) / (1 << 30):.2f} GiB), '
+                        f'deleting uncompressed plot {old["fullpath"]}'
+                    )
+                    try:
+                        subprocess.check_call(['ssh', mach, f'rm "{old["fullpath"]}"'])
+                        old_fullpath = old['fullpath']
+                    except Exception as e:
+                        logging.error(f'Error deleting uncompressed plot {old["fullpath"]}: {e}')
+                        continue
 
-                # Re-get free space after delete
-                try:
-                    free_output = subprocess.check_output(
-                        ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
-                    ).decode().strip()
-                    free_space = int(free_output)
-                except Exception as e:
-                    logging.error(f'Error getting free space after delete: {e}')
-                    continue
+                    # Re-get free space after delete
+                    try:
+                        free_output = subprocess.check_output(
+                            ['ssh', mach, f'df -B1 --output=avail "{plot_dir}" | tail -1']
+                        ).decode().strip()
+                        free_space = int(free_output)
+                    except Exception as e:
+                        logging.error(f'Error getting free space after delete: {e}')
+                        continue
 
-                with lock:
-                    pend = pending.get(mkey, 0)
-                    effective_free = free_space - pend
+                    with lock:
+                        pend = pending.get(mkey, 0)
+                        effective_free = free_space - pend
 
-                if effective_free < new_size + buffer_space:
-                    logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
-                    continue
+                    if effective_free < new_size + buffer_space:
+                        logging.error(f'Still insufficient space after delete for {mach}:{plot_dir}')
+                        continue
 
             # Rename new plot to .tmp locally
             tmp_file = new_plot_file + '.tmp'
